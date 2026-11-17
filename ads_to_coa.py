@@ -148,8 +148,8 @@ def vet_papers(docs, is_me, orcid, institutions, accept_sim=0.6, review_sim=0.4)
     def key(a):
         l, f = split_name(a)
         return last_key(l) + '|' + ''.join(t[0] for t in given(f))
-    def coauthors(d):
-        return {key(a) for a in d.get('author') or [] if not is_me(a)}
+    def coauthors(d):  # people only: a "VERITAS Collaboration" author entry says nothing about who wrote it
+        return {key(a) for a in d.get('author') or [] if not is_me(a) and not IS_GROUP.search(a)}
     accepted = [(d['bibcode'], coauthors(d)) for d in docs if d['_status'] == 'accept']
     by_bib = {d['bibcode']: d for d in docs}
 
@@ -184,10 +184,12 @@ def vet_papers(docs, is_me, orcid, institutions, accept_sim=0.6, review_sim=0.4)
             continue
         if no_aff and len(others) >= 20 and sim >= accept_sim:
             d['_status'] = 'accept'
-        elif sim >= review_sim or (no_aff and len(others) < 10 and shared >= 2 and shared >= 0.5 * len(others)):
-            d['_status'] = 'review'
+        elif sim >= review_sim or (no_aff and len(others) < 10 and shared >= 1 and shared >= 0.5 * len(others)):
+            d['_status'] = 'review'  # e.g. a 2-author ATel whose co-author is on your accepted papers
         d['_why'] += f'; author list {sim:.0%} like {like}' if like else ''
         d['_why'] += f'; {shared} of {len(others)} co-authors on accepted papers'
+        if not others:
+            d['_why'] += ' (no individual co-authors: does not change the COA)'
     return docs
 
 
@@ -372,7 +374,12 @@ def classify_papers(docs, is_me, min_authors=20, min_overlap=0.3):
         big = len(d.get('author') or []) >= min_authors
         text = groups + (' ; ' + ' '.join(d.get('title') or ['']) if big else '')
         d['_collab'] = [n for n, p in pats if p.search(text)]
+        if big:  # e.g. "Japanese MAGIC Group: ICRR" on 65 authors of a paper whose only group author is VERITAS
+            affs = [a for a in d.get('aff') or [] if a and a != '-']
+            d['_collab'] += [n for n, p in pats if n not in d['_collab'] and sum(bool(p.search(a)) for a in affs) >= 5]
+            d['_collab'].sort(key=[n for n, _ in COLLABS].index)
         d['_collab_how'] = 'name' if d['_collab'] else ''
+        d['_size_note'] = ''
         d['_keys'] = {key(a) for a in d.get('author') or [] if not is_me(a) and not IS_GROUP.search(a)}
     tagged = [d for d in docs if d['_collab']]
     for d in docs:
@@ -382,6 +389,31 @@ def classify_papers(docs, is_me, min_authors=20, min_overlap=0.3):
                         default=(0, None), key=lambda x: x[0])
         if best and sim >= min_overlap:
             d['_collab'], d['_collab_how'] = list(best['_collab']), 'overlap'
+    # an erratum or preprint shares its paper's collaborations (ADS often has no affiliations on errata)
+    base = lambda d: re.sub(r'[^a-z0-9]', '', re.sub(r'^\s*(correction|erratum|corrigendum|addendum)\s*(to)?\s*:?', '',
+                                                      fold((d.get('title') or [''])[0])))
+    by_title = {}
+    for d in docs:
+        by_title.setdefault(base(d), []).append(d)
+    for same in by_title.values():
+        if len(same) > 1:
+            union = sorted({c for d in same for c in d['_collab']}, key=[n for n, _ in COLLABS].index)
+            for d in same:
+                if union and set(d['_collab']) != set(union):
+                    d['_collab'], d['_collab_how'] = union, d['_collab_how'] or 'name'
+
+    # a paper far larger than the collaboration's other papers is probably a joint paper not named as one
+    sizes = {}
+    for d in docs:
+        if len(d['_collab']) == 1:
+            sizes.setdefault(d['_collab'][0], []).append(len(d.get('author') or []))
+    for d in docs:
+        if len(d['_collab']) == 1 and len(sizes[d['_collab'][0]]) >= 3:
+            med = sorted(sizes[d['_collab'][0]])[len(sizes[d['_collab'][0]]) // 2]
+            n = len(d.get('author') or [])
+            if n > 3 * med and n - med > 100:
+                d['_size_note'] = (f'{n} authors vs typically {med} on {d["_collab"][0]} papers: '
+                                   f'probably a joint paper with other collaborations')
     for d in docs:
         del d['_keys']
     return docs
@@ -417,9 +449,12 @@ def paper_sections(docs, max_authors, review=()):
             na = len(d.get('author') or [])
             d['_title'] = re.sub(r'<[^>]+>', '', html.unescape((d.get('title') or [''])[0]))
             flags = ['collaboration guessed from author overlap'] if d.get('_collab_how') == 'overlap' else []
+            if d.get('_size_note'):
+                flags.append(d['_size_note'])
             if max_authors and na > max_authors:
                 flags.append(f'skipped: {na} authors > {max_authors}')
-            tk = re.sub(r'[^a-z0-9]', '', fold(d['_title']))
+            tk = re.sub(r'[^a-z0-9]', '', re.sub(r'^\s*(correction|erratum|corrigendum|addendum)\s*(to)?\s*:?', '',
+                                                 fold(d['_title'])))
             if tk in seen:
                 flags.append(f'same title as #{seen[tk]}')
             else:
@@ -438,8 +473,14 @@ def paper_list(docs, max_authors, person, review=()):
            '', 'Grouped by collaboration (named as an author or in the title; "~" = guessed from author overlap).', '']
     def line(d):
         flags = ''.join(' ~' if f.startswith('collaboration guessed') else f' **[{f}]**' for f in d['_flags'])
-        return (f'{d["_num"]}. {d["pubdate"][:7]} | {d["_title"]} | {d.get("pub") or ""} | '
+        out_ = (f'{d["_num"]}. {d["pubdate"][:7]} | {d["_title"]} | {d.get("pub") or ""} | '
                 f'{len(d.get("author") or [])} authors | [{d["bibcode"]}]({UI}/abs/{d["bibcode"]}/abstract){flags}')
+        if '_out' in d:  # review papers: who is and is not already in the spreadsheet
+            out_ += ('\n   - NOT in spreadsheet: ' + ('; '.join(a for _, a in sorted(d['_out'], key=lambda x: fold(x[1])))
+                                                     or 'none') +
+                     '\n   - already in spreadsheet: ' + ('; '.join(f'{a} (row {r})' for r, a in
+                                                                  sorted(d['_in'], key=lambda x: fold(x[1]))) or 'none'))
+        return out_
     last = None
     for sec, sub, ds in secs:
         if sec != last:
@@ -678,13 +719,21 @@ def make_slides(path, person, report, secs, people, concerns, flags, review=()):
         f'Query: {report["query"]}',
         f'Countries-of-concern matches: {len(concerns)}   |   items to review: {sum(len(v) for v in flags.values())}'],
         16)
+    un = report.get('unmatched_affiliations') or []
+    if un:
+        text(sl, 0.8, 5.4, 11.7, 1.9,
+             [f'Check: {sum(n for _, n in un)} papers were left out because your affiliation on them did not match '
+              f'--institution. If these are you, add them and rerun:'] +
+             [f'   {n} papers:  {aff[:110]}' for aff, n in un[:4]], 13, RED)
 
     # 2. papers by collaboration
     rows = []
     for sec, sub, ds in secs:
         na = [len(d.get('author') or []) for d in ds]
         names = {p['name'] for p in people for b in p['papers'] if b in {d['bibcode'] for d in ds}}
-        rows.append([sub or sec, len(ds), short_ranges([d['_num'] for d in ds], 45, '#'),
+        odd = [d['_num'] for d in ds if d.get('_size_note')]
+        rows.append([(sub or sec) + (f'  (check {", ".join("#" + str(n) for n in odd)}: unusually large)' if odd else ''),
+                     len(ds), short_ranges([d['_num'] for d in ds], 45, '#'),
                      f'{min(na)}' if min(na) == max(na) else f'{min(na)}-{max(na)}',
                      '' if sec.startswith('Not used') else len(names)])
     paged('Papers used, by collaboration',
@@ -793,7 +842,19 @@ def make_slides(path, person, report, secs, people, concerns, flags, review=()):
     merged = {}
     for sec, sub, ds in secs:
         merged.setdefault(sec, []).extend((sub, d) for d in ds)
+    def names(lst, k=8, rows=False):
+        lst = sorted(lst, key=lambda x: fold(x[1]))
+        txt = '; '.join((f'{a} (row {r})' if rows and r else a) for r, a in lst[:k])
+        return (txt + f'; +{len(lst) - k} more' if len(lst) > k else txt) or 'none'
     for sec, items in merged.items():
+        if sec.startswith('Not used'):
+            paged(sec, f'{len(items)} papers, not used: their co-authors are in the spreadsheet only if they are also '
+                       f'on a used paper. --include BIBCODE adds the "not in spreadsheet" people.',
+                  ['#', 'Date', 'Title / bibcode', 'Authors', 'NOT in spreadsheet', 'Already in spreadsheet'],
+                  [[d['_num'], d['pubdate'][:7], d['_title'][:80] + '\n' + d['bibcode'], len(d.get('author') or []),
+                    names(d.get('_out', [])), names(d.get('_in', []), 6, rows=True)] for _, d in items],
+                  [0.5, 0.8, 4.2, 0.8, 3.0, 3.0], per=7, size=9)
+            continue
         paged(sec, f'{len(items)} papers', ['#', 'Date', 'Title', 'Journal', 'Authors', 'Bibcode / notes'],
               [[d['_num'], d['pubdate'][:7], (f'[{sub}] ' if sub else '') + d['_title'][:120],
                 (d.get('pub') or '')[:38], len(d.get('author') or []),
@@ -1112,6 +1173,12 @@ def main():
         out_pptx = os.path.splitext(out_xlsx)[0] + '_check.pptx'
         n_sl = make_slides(out_pptx, person, report, secs, people, concerns, report['review'], review_docs)
         print(f'Slides written to {out_pptx} ({n_sl} slides)')
+    unmatched = {}
+    for d in found:  # your own affiliation on papers rejected only because it did not match --institution
+        if d['_status'] != 'accept' and d['_why'].startswith('affiliation does not match'):
+            k = clean_aff(d['_slot_aff'])
+            unmatched[k] = unmatched.get(k, 0) + 1
+    report['unmatched_affiliations'] = sorted(unmatched.items(), key=lambda x: -x[1])
     seen = orcids_seen(found, is_me) if not a.link else []
     report['orcids_on_accepted_papers'] = seen
     with open(out_json, 'w', encoding='utf-8') as f:
@@ -1130,6 +1197,17 @@ def main():
         print(f'{len(found)} papers found: {n["accept"]} accepted, {n["review"]} to review, {n["reject"]} rejected')
         if n['review']:
             print('  Check the "review" papers in the .json; add yours with --include BIBCODE ...')
+            for d in review_docs:
+                new_ = sorted((a_ for _, a_ in d['_out']), key=fold)
+                print(f'    #{d["_num"]} {d["bibcode"]} ({len(d.get("author") or [])} authors): '
+                      f'{len(d["_in"])} already in spreadsheet; not in spreadsheet: '
+                      + ('; '.join(new_[:6]) + (f'; +{len(new_) - 6} more' if len(new_) > 6 else '') if new_ else 'none'))
+        if report['unmatched_affiliations']:
+            n_un = sum(n for _, n in report['unmatched_affiliations'])
+            print(f'  {n_un} papers were left out because your affiliation on them did not match --institution:')
+            for aff, k in report['unmatched_affiliations'][:8]:
+                print(f'    {k:4d}  {aff[:110]}')
+            print('  If any of these are you, add a pattern for it (e.g. --institution "Santa Cruz" "East Bay") and rerun.')
         if seen and not a.orcid:
             print(f'  ORCID on your accepted papers: {seen[0][0]} ({seen[0][1]} papers); '
                   f'if it is yours, rerun with --orcid {seen[0][0]}')

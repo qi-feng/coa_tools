@@ -69,6 +69,11 @@ in all fields. So search mode needs at least one of these:
 - `--institution "Utah" "Smithsonian|Harvard" "Barnard|Columbia"`: your institutions during the window, as text or
   regular expressions. Each is checked against **your own** affiliation on each paper, not against your co-authors'.
 
+Patterns are matched against the affiliation text exactly as ADS has it, which is usually written out
+(`University of California, Santa Cruz`, `California State University - East Bay`): an abbreviation such as `UCSC` or
+`CSU` matches only papers that use it. The script prints your affiliations on papers it left out for not matching, and
+the title slide lists them too; add a pattern for any that are yours and rerun. `--orcid` avoids the problem altogether.
+
 Other search options:
 - `--field`: `physics` (astronomy + physics collections, default), `astronomy`, or `any`.
 - `--include BIBCODE ...`: accept papers you confirmed from the review list.
@@ -79,7 +84,7 @@ Each paper found is sorted into one of three groups:
 | Status | When                                                                                                                                                                                                                                                                                                                   |
 | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | accept | Your ORCID is on your author slot. Or your affiliation on that paper matches `--institution`. Or, when no affiliation is listed and there are 20+ authors, its author list is at least 60% the same as one accepted paper's (collaboration proceedings, errata, arXiv versions).                                       |
-| review | Its author list is 40–60% like an accepted paper's. Or it is a short paper with no affiliation where half the co-authors appear on accepted papers.                                                                                                                                                                    |
+| review | Its author list is 40–60% like an accepted paper's. Or it is a short paper with no affiliation where at least half the co-authors (at least one) appear on accepted papers, e.g. a 2-author ATel.                                                                                                                      |
 | reject | Someone else's ORCID is on that author slot. Or the affiliation is a different institution and co-authors are unrelated. Or the similar accepted paper has a **namesake**: e.g. a proceedings paper listing just "Smith, J." is rejected when the closest accepted paper lists both "Smith, J. A." and "Smith, J. R.". |
 
 Only accepted papers go into the spreadsheet. The `.json` lists every paper with its status, the reason, your affiliation
@@ -110,8 +115,9 @@ python3 ads_to_coa.py "https://ui.adsabs.harvard.edu/public-libraries/<LIBRARY_I
 `--list-papers` prints every paper the co-authors came from, numbered, with date, title, journal, author count and an
 ADS link, and writes the same list to `NAME_papers.md`. Papers are grouped so you can check them a block at a time:
 
-- one section per collaboration (VERITAS, CTAO, EHT, ...), when the collaboration is a group author on the paper, or is
-  named in the title of a paper with 20+ authors;
+- one section per collaboration (VERITAS, CTAO, EHT, ...), when the collaboration is a group author on the paper, is
+  named in the title of a paper with 20+ authors, or is named in at least 5 authors' affiliations (e.g. "MAGIC Group");
+  a paper with far more authors than the collaboration's other papers is flagged as probably joint;
 - **Joint collaboration papers**, with a subsection per combination (e.g. `VERITAS + IceCube`, `CTAO + IceCube`);
 - **Small-team and other papers**: the ones most worth reading line by line;
 - **Not used: to review**: candidates you can add with `--include`.
