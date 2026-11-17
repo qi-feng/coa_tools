@@ -14,7 +14,7 @@ all of ADS for you and work out which papers are really yours.
 
 ## Requirements
 
-Python 3.8+ and openpyxl (`pip install openpyxl`). No ADS API token is needed.
+Python 3.8+ and openpyxl (`pip install openpyxl`); python-pptx for `--slides` (`pip install python-pptx`). No ADS API token is needed.
 If you have one, set `ADS_API_TOKEN` (or put it in `~/.ads/dev_key`) and it is used instead.
 
 ## Usage
@@ -49,6 +49,13 @@ python3 ads_to_coa.py [TEMPLATE.xlsx] --person "Last, First M." --orcid ORCID --
   `"Smith, John A."` does not match `Smith, J. R.`.
 - `--months`: look-back window, 48 by default (NSF rule for co-authors).
 - `--max-authors N`: skip papers with more than N authors. See the large-collaboration note below.
+- `--list-papers`: print a numbered list of every paper used, grouped by collaboration, and write it to `NAME_papers.md`
+  (see **Checking the papers** below).
+- `--slides`: write `NAME_check.pptx`, a slide deck for checking the result (see **Checking with the slides** below).
+  Needs `pip install python-pptx`.
+- `--order collab`: write the new Table 4 rows grouped by collaboration (direct collaborators first, then CTAO,
+  VERITAS, ..., joint papers, questionable), alphabetical within each group, so each group is one block of rows.
+  The default, `--order name`, is fully alphabetical.
 - `--out NAME.xlsx`: output file name. The report is written next to it as `NAME.json`.
   The default is `<template>_ADS.xlsx`, or `coa_<Last>_ADS.xlsx` in the current folder when the template was downloaded.
   The output can't be the template itself.
@@ -69,10 +76,10 @@ Other search options:
 
 Each paper found is sorted into one of three groups:
 
-| Status | When                                                                                                                                                                                                                                                                                                                            |
-| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| accept | Your ORCID is on your author slot. Or your affiliation on that paper matches `--institution`. Or, when no affiliation is listed and there are 20+ authors, its author list is at least 60% the same as one accepted paper's (collaboration proceedings, errata, arXiv versions).                                                |
-| review | Its author list is 40–60% like an accepted paper's. Or it is a short paper with no affiliation where half the co-authors appear on accepted papers.                                                                                                                                                                             |
+| Status | When                                                                                                                                                                                                                                                                                                                   |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| accept | Your ORCID is on your author slot. Or your affiliation on that paper matches `--institution`. Or, when no affiliation is listed and there are 20+ authors, its author list is at least 60% the same as one accepted paper's (collaboration proceedings, errata, arXiv versions).                                       |
+| review | Its author list is 40–60% like an accepted paper's. Or it is a short paper with no affiliation where half the co-authors appear on accepted papers.                                                                                                                                                                    |
 | reject | Someone else's ORCID is on that author slot. Or the affiliation is a different institution and co-authors are unrelated. Or the similar accepted paper has a **namesake**: e.g. a proceedings paper listing just "Smith, J." is rejected when the closest accepted paper lists both "Smith, J. A." and "Smith, J. R.". |
 
 Only accepted papers go into the spreadsheet. The `.json` lists every paper with its status, the reason, your affiliation
@@ -97,6 +104,66 @@ python3 ads_to_coa.py --person "Smith, John A." --orcid 0000-0000-0000-0000 --in
 # from your own ADS library, adding to a COA you already started
 python3 ads_to_coa.py "https://ui.adsabs.harvard.edu/public-libraries/<LIBRARY_ID>" my_coa.xlsx --out my_coa_updated.xlsx
 ```
+
+## Checking the papers
+
+`--list-papers` prints every paper the co-authors came from, numbered, with date, title, journal, author count and an
+ADS link, and writes the same list to `NAME_papers.md`. Papers are grouped so you can check them a block at a time:
+
+- one section per collaboration (VERITAS, CTAO, EHT, ...), when the collaboration is a group author on the paper, or is
+  named in the title of a paper with 20+ authors;
+- **Joint collaboration papers**, with a subsection per combination (e.g. `VERITAS + IceCube`, `CTAO + IceCube`);
+- **Small-team and other papers**: the ones most worth reading line by line;
+- **Not used: to review**: candidates you can add with `--include`.
+
+A `~` marks a collaboration guessed from author overlap with a tagged paper; `[same title as #N]` marks a likely
+duplicate (preprint, erratum, Zenodo version); `[skipped: N authors > M]` marks papers left out by `--max-authors`.
+The `.json` also carries a `collaboration` field for every paper.
+
+## Checking with the slides
+
+```
+python3 ads_to_coa.py --person "Last, First" --orcid ORCID --institution PATTERN --slides --order collab --list-papers --out coa_Last_2026.xlsx
+```
+
+writes `coa_Last_2026.xlsx`, `.json`, `_papers.md` and `coa_Last_2026_check.pptx`. Open the deck in PowerPoint or
+Google Slides and go through it in order:
+
+1. **Title**: person, date window, ADS query, and the counts of papers, co-authors, country matches and names to check.
+   If the number of papers looks wrong, stop here and fix `--orcid`, `--institution`, `--include` or `--exclude`.
+2. **Papers used, by collaboration**: one row per collaboration (VERITAS, CTAO, EHT, ...), per combination of
+   collaborations on joint papers (e.g. VERITAS + IceCube), and for small-team papers, with their paper numbers, the
+   **author-list length** (fewest-most authors on any one paper in that row, e.g. `59-826`) and the number of
+   **unique co-authors** on those papers together (different people other than you, each counted once; a person on
+   VERITAS and CTAO papers counts in both rows, so the column adds up to more than the total). A 600-author paper in a section you didn't expect is the
+   first thing to question; `--max-authors` drops papers above a size.
+3. **Co-authors, by group**: each co-author is placed in one group: *direct collaborators* (on any small-team paper
+   with you), the collaboration on most of your shared papers, *Joint: A + B* (only on papers of those collaborations
+   together, e.g. IceCube members on a VERITAS + IceCube paper), *several collaborations* (a tie), or *questionable*.
+   With `--order collab` the Table 4 rows column is one block per group, so you can check or delete a whole group
+   in the spreadsheet at once.
+4. **Countries of concern**: every co-author with any affiliation, on any shared paper and in any position, that names
+   China (including Hong Kong and Macau), Cuba, Iran, North Korea, Russia or Venezuela, with the matching affiliation,
+   their Table 4 row, group and paper numbers. This is a text match: it can miss an institute listed without its
+   country and can flag a false match, so check each entry. Taiwan and South Korea are not matched.
+   The same list is in the `.json` under `countries_of_concern`.
+5. **Questionable**: co-authors only on large papers with no collaboration named, or on papers whose collaboration
+   was guessed from author overlap.
+6. **To review**: papers found but not confirmed as yours, so not used. A table gives each one's title, your
+   affiliation on it and why it was not used; then one slide per paper splits its co-authors into those **not in the
+   spreadsheet** (they would be added if you rerun with `--include BIBCODE`) and those **already in the spreadsheet**
+   from used papers, with their Table 4 row. A paper that is yours but adds no one new can be left out safely.
+   The same lists are in the `.json` under `review_papers`.
+7. **Names to check**: possible merges of two people with the same initials, missing affiliations, and near-duplicates
+   of names already on the sheet (the `review` section of the `.json`).
+8. **Paper list**: every paper, numbered, by section, with date, title, journal, author count, bibcode and notes
+   (duplicate titles, papers skipped by `--max-authors`, guessed collaborations). The papers under *Not used: to review*
+   can be added with `--include`.
+9. **Co-author names by group**: every co-author with their Table 4 row, a group per run of slides.
+
+The most useful checks are usually the direct-collaborator list (these people must be on your COA), the countries
+list, and the questionable groups. For large collaborations, decide at the group level whether your solicitation
+wants them listed (see **Large collaborations**).
 
 ## What it does with the papers
 

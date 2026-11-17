@@ -57,10 +57,11 @@ def ads_token():
 
 
 def ads_search(query, token, fq=None):
-    fl = 'bibcode,title,pubdate,author,aff,doctype,author_count,orcid_pub,orcid_user,orcid_other'
+    fl = 'bibcode,title,pub,pubdate,author,aff,doctype,author_count,orcid_pub,orcid_user,orcid_other'
     docs, start = [], 0
     while True:
-        params = {'q': query, 'fl': fl, 'rows': 200, 'start': start, 'sort': 'date desc'}
+        # bibcode breaks ties: sorting by date alone lets ADS shuffle same-date papers between pages
+        params = {'q': query, 'fl': fl, 'rows': 200, 'start': start, 'sort': 'date desc, bibcode desc'}
         if fq:
             params['fq'] = fq
         req = urllib.request.Request(f'{API}/search/query?' + urllib.parse.urlencode(params),
@@ -69,8 +70,9 @@ def ads_search(query, token, fq=None):
             resp = json.load(r)['response']
         docs += resp['docs']
         start += 200
-        if start >= resp['numFound']:
-            return docs
+        if start >= resp['numFound'] or not resp['docs']:
+            seen = set()
+            return [d for d in docs if not (d['bibcode'] in seen or seen.add(d['bibcode']))]
 
 
 def link_to_query(link):
@@ -256,7 +258,9 @@ def latin1(s):
     return re.sub(r'\s+', ' ', ''.join(out)).strip(' ,;')
 
 
-IS_GROUP = re.compile(r'collaboration|consortium|^the |team$|group$', re.I)
+IS_GROUP = re.compile(r'collaboration|consortium|\bproject\b|^the |team$|group$|'
+                      r'^(ctao?|veritas|icecube|h\.?e\.?s\.?s\.?|magic|hawc|fermi[- ]lat|lhaaso|eht|ligo|virgo|kagra|'
+                      r'km3net|antares|auger|nanograv|rno-g)$', re.I)
 
 STREET = re.compile(r'\b(str\.|strasse|straße|street|st\.|avenue|ave\.?|road|rd\.|blvd|boulevard|bag|box|c/|via|'
                     r'calle|rue|chaussée|plaza|place|pl\.|allee|weg|ul\.|cedex|campus|bldg|building|p\.o\.)', re.I)
@@ -290,8 +294,11 @@ def collect_people(docs, is_me, max_authors):
         for a, af in zip(authors, affs):
             if IS_GROUP.search(a) or is_me(a):
                 continue
+            r = recs.setdefault(a, dict(name=a, aff='', date=date, papers=[], raw={}))
+            raw = html.unescape(af or '').strip()
+            if raw not in ('', '-'):
+                r['raw'][raw] = d['bibcode']
             af = clean_aff(af)
-            r = recs.setdefault(a, dict(name=a, aff='', date=date, papers=[]))
             r['date'] = date
             r['aff'] = af or r['aff']
             r['papers'].append(d['bibcode'])
@@ -317,8 +324,452 @@ def collect_people(docs, is_me, max_authors):
         people.append(dict(
             name=best['name'], affiliation=next((m['aff'] for m in newest if m['aff']), ''),
             last_active=newest[0]['date'], variants=sorted(m['name'] for m in c),
-            papers=sorted({p for m in c for p in m['papers']}), lk=best['lk'], g=best['g']))
+            papers=sorted({p for m in c for p in m['papers']}), lk=best['lk'], g=best['g'],
+            raw={k: v for m in c for k, v in m['raw'].items()}))
     return people
+
+
+# ---------------------------------------------------------------- paper list for checking
+# Collaboration names, matched against group authors ("VERITAS Collaboration") and titles.
+# Source names such as "HESS J1745-290" or "MAGIC J0223+430" are not counted.
+NOT_SRC = r'(?![\s-]*J\d)'
+COLLABS = [
+    ('CTAO', r'\bCTAO?\b|Cherenkov Telescope Array|\bLST-?\d?\b|Large[- ]Sized Telescope|Schwarzschild[- ]Couder|\bp?SCT\b'),
+    ('VERITAS', r'\bVERITAS\b'),
+    ('IceCube', r'IceCube'),
+    ('LIGO-Virgo-KAGRA', r'\bLIGO\b|\bKAGRA\b|Virgo Collaboration'),
+    ('EHT', r'Event Horizon Telescope|\bEHT\b'),
+    ('Fermi-LAT', r'Fermi[- ]LAT|Fermi Large Area Telescope'),
+    ('H.E.S.S.', r'H\.\s?E\.\s?S\.\s?S\.' + NOT_SRC + r'|\bHESS\b' + NOT_SRC),
+    ('MAGIC', r'\bMAGIC\b' + NOT_SRC),
+    ('HAWC', r'\bHAWC\b' + NOT_SRC),
+    ('LHAASO', r'\bLHAASO\b' + NOT_SRC),
+    ('KM3NeT', r'KM3NeT|ANTARES'),
+    ('Pierre Auger', r'Pierre Auger'),
+    ('NANOGrav', r'NANOGrav'),
+    ('RNO-G', r'RNO-G'),
+]
+
+
+def classify_papers(docs, is_me, min_authors=20, min_overlap=0.3):
+    """Tag each paper with the collaborations it belongs to (d['_collab']).
+
+    1. A collaboration named as a group author counts; one named in the title counts for papers with
+       min_authors+ authors (a short paper about VERITAS data is a small-team paper, not a collaboration one).
+    2. A paper with min_authors+ authors and no name match takes the collaborations of the most similar
+       tagged paper, if their author lists overlap by min_overlap or more (marked d['_collab_how'] = 'overlap').
+    """
+    pats = [(n, re.compile(r, re.I if n not in ('MAGIC', 'HAWC', 'EHT', 'CTAO') else 0)) for n, r in COLLABS]
+    def key(a):
+        l, f = split_name(a)
+        return last_key(l) + '|' + ''.join(t[0] for t in given(f))
+    for d in docs:
+        groups = ' ; '.join(a for a in d.get('author') or [] if IS_GROUP.search(a))
+        big = len(d.get('author') or []) >= min_authors
+        text = groups + (' ; ' + ' '.join(d.get('title') or ['']) if big else '')
+        d['_collab'] = [n for n, p in pats if p.search(text)]
+        d['_collab_how'] = 'name' if d['_collab'] else ''
+        d['_keys'] = {key(a) for a in d.get('author') or [] if not is_me(a) and not IS_GROUP.search(a)}
+    tagged = [d for d in docs if d['_collab']]
+    for d in docs:
+        if d['_collab'] or len(d['_keys']) < min_authors:
+            continue
+        sim, best = max(((len(d['_keys'] & t['_keys']) / max(1, len(d['_keys'] | t['_keys'])), t) for t in tagged),
+                        default=(0, None), key=lambda x: x[0])
+        if best and sim >= min_overlap:
+            d['_collab'], d['_collab_how'] = list(best['_collab']), 'overlap'
+    for d in docs:
+        del d['_keys']
+    return docs
+
+
+SMALL_TEAM = 20  # papers with fewer authors and no collaboration tag count as small-team papers
+
+
+def paper_sections(docs, max_authors, review=()):
+    """Group and number papers: [(section, subsection, [docs])]. Sets d['_num'] and d['_flags'] on each."""
+    order = [n for n, _ in COLLABS]
+    single, joint, other = {}, {}, []
+    for d in sorted(docs, key=lambda d: d['pubdate'], reverse=True):
+        c = d.get('_collab') or []
+        if len(c) == 1:
+            single.setdefault(c[0], []).append(d)
+        elif c:
+            joint.setdefault(' + '.join(sorted(c, key=order.index)), []).append(d)
+        else:
+            other.append(d)
+    secs = [(n, '', single[n]) for n in sorted(single, key=lambda n: (order.index(n) > 1, -len(single[n]),
+                                                                       order.index(n)))]
+    secs += [('Joint collaboration papers', n, joint[n]) for n in sorted(joint, key=lambda n: -len(joint[n]))]
+    if other:
+        secs.append(('Small-team and other papers', '', other))
+    if review:
+        secs.append(('Not used: to review', '', sorted(review, key=lambda d: d['pubdate'], reverse=True)))
+    seen, i = {}, 0
+    for _, _, ds in secs:
+        for d in ds:
+            i += 1
+            d['_num'] = i
+            na = len(d.get('author') or [])
+            d['_title'] = re.sub(r'<[^>]+>', '', html.unescape((d.get('title') or [''])[0]))
+            flags = ['collaboration guessed from author overlap'] if d.get('_collab_how') == 'overlap' else []
+            if max_authors and na > max_authors:
+                flags.append(f'skipped: {na} authors > {max_authors}')
+            tk = re.sub(r'[^a-z0-9]', '', fold(d['_title']))
+            if tk in seen:
+                flags.append(f'same title as #{seen[tk]}')
+            else:
+                seen[tk] = i
+            d['_flags'] = flags
+    return secs
+
+
+def paper_list(docs, max_authors, person, review=()):
+    """Markdown list of the papers used, numbered and grouped by collaboration."""
+    secs = paper_sections(docs, max_authors, review)
+    n_used = sum(not (max_authors and len(d.get('author') or []) > max_authors) for d in docs)
+    out = [f'# Papers used for the COA of {person}', '',
+           f'{len(docs)} accepted papers; {n_used} used for co-authors'
+           + (f' ({len(docs) - n_used} skipped with more than {max_authors} authors)' if n_used < len(docs) else ''),
+           '', 'Grouped by collaboration (named as an author or in the title; "~" = guessed from author overlap).', '']
+    def line(d):
+        flags = ''.join(' ~' if f.startswith('collaboration guessed') else f' **[{f}]**' for f in d['_flags'])
+        return (f'{d["_num"]}. {d["pubdate"][:7]} | {d["_title"]} | {d.get("pub") or ""} | '
+                f'{len(d.get("author") or [])} authors | [{d["bibcode"]}]({UI}/abs/{d["bibcode"]}/abstract){flags}')
+    last = None
+    for sec, sub, ds in secs:
+        if sec != last:
+            n = sum(len(x) for s_, _, x in secs if s_ == sec)
+            out += [f'## {sec} ({n})', '']
+            if sec.startswith('Not used'):
+                out += ['Add yours with --include BIBCODE ...', '']
+            last = sec
+        if sub:
+            out += [f'### {sub} ({len(ds)})', '']
+        out += [line(d) for d in ds] + ['']
+    return '\n'.join(out)
+
+
+# ---------------------------------------------------------------- co-author groups and checks
+GROUP_DIRECT = 'Direct collaborators (small-team papers)'
+GROUP_SEVERAL = 'Several collaborations'
+GROUP_GUESSED = 'Questionable: collaboration guessed'
+GROUP_UNTAGGED = 'Questionable: large paper, no collaboration'
+
+
+def assign_groups(people, docs):
+    """Give each co-author one group (p['group']) from the papers they share with you."""
+    by_bib = {d['bibcode']: d for d in docs}
+    for p in people:
+        ps = [by_bib[b] for b in p['papers'] if b in by_bib]
+        p['paper_nums'] = sorted(d['_num'] for d in ps if '_num' in d)
+        if any(not d['_collab'] and len(d.get('author') or []) < SMALL_TEAM for d in ps):
+            p['group'] = GROUP_DIRECT
+            continue
+        tagged = [d for d in ps if d['_collab']]
+        if not tagged:
+            p['group'] = GROUP_UNTAGGED
+            continue
+        if all(d['_collab_how'] == 'overlap' for d in tagged):
+            p['group'] = GROUP_GUESSED
+            continue
+        # the collaboration on most of their papers; a tie between collaborations that always appear
+        # together means they are only on joint papers (e.g. an IceCube member on VERITAS + IceCube papers)
+        count = {}
+        for d in tagged:
+            for c in d['_collab']:
+                count[c] = count.get(c, 0) + 1
+        top = max(count.values())
+        best = [c for c in count if count[c] == top]
+        p['also'] = sorted(set(count) - set(best), key=[n for n, _ in COLLABS].index)
+        if len(best) == 1:
+            p['group'] = best[0]
+        elif all(set(best) <= set(d['_collab']) for d in tagged if set(best) & set(d['_collab'])):
+            p['group'] = 'Joint: ' + ' + '.join(sorted(best, key=[n for n, _ in COLLABS].index))
+        else:
+            p['group'] = GROUP_SEVERAL
+    return people
+
+
+def group_order(name):
+    order = [n for n, _ in COLLABS]
+    if name == GROUP_DIRECT:
+        return (0, 0, name)
+    if name in order:
+        return (1, order.index(name), name)
+    if name == GROUP_SEVERAL:
+        return (2, 0, name)
+    if name.startswith('Joint'):
+        return (3, 0, name)
+    return (4, 0, name)
+
+
+# Affiliations in these countries are listed for a manual research-security check. Matching is on text, so
+# false positives (e.g. Moscow, Idaho) and misses (an institute named without its country) are both possible.
+CONCERN = [
+    ('China', r'\bChina\b|\bP\.\s?R\.\s?C\b|\bPRC\b|Chinese Academy|Beijing|Shanghai|Nanjing|Hefei|Wuhan|Chengdu|'
+              r'Kunming|Tianjin|Guangzhou|Shenzhen|Xi\'?an\b|Lanzhou|Harbin|Changchun|Jinan|Hangzhou|Tsinghua|'
+              r'Peking|Shandong|Yunnan|Sichuan|Zhejiang|Guangxi|Hebei|Xinjiang|Tibet|Qinghai'),
+    ('Hong Kong', r'Hong Kong'),
+    ('Macau', r'\bMaca[uo]\b'),
+    ('Cuba', r'\bCuba\b|Havana|La Habana'),
+    ('Iran', r'\bIran\b|Tehran|Isfahan|Shiraz|Tabriz|Mashhad'),
+    ('North Korea', r'North Korea|\bDPRK\b|Pyongyang|Democratic People'),
+    ('Russia', r'Russia|Moscow|Novosibirsk|Petersburg|Dubna|Troitsk|Protvino|Kazan|Yekaterinburg|Tomsk|Irkutsk|'
+               r'Nizhny|\bJINR\b|Lebedev|Ioffe'),
+    ('Venezuela', r'Venezuela|Caracas'),
+]
+NOT_CONCERN = {'China': r'Taiwan|Taipei|Hsinchu|Taoyuan|Tainan|Kaohsiung',
+               'Russia': r'Idaho|\bID\b|Florida|\bFL\b|USA|United States'}
+
+
+def concern_matches(people):
+    """People with any affiliation (on any shared paper, any position) that names a listed country."""
+    pats = [(c, re.compile(r)) for c, r in CONCERN]
+    nots = {c: re.compile(r) for c, r in NOT_CONCERN.items()}
+    hits = []
+    for p in people:
+        found = []
+        for raw, bib in p.get('raw', {}).items():
+            for part in re.split(r';(?![^&]*;)', raw):
+                for c, pat in pats:
+                    if pat.search(part) and not (c in nots and nots[c].search(part)):
+                        found.append((c, part.strip(), bib))
+        if found:
+            hits.append(dict(name=p['name'], countries=sorted({c for c, _, _ in found}),
+                             affiliations=sorted({a for _, a, _ in found}), group=p.get('group', ''),
+                             row=p.get('row'), papers=p.get('paper_nums', []),
+                             current_affiliation=p['affiliation']))
+    return sorted(hits, key=lambda h: (h['countries'], fold(h['name'])))
+
+
+def review_coauthors(review, people, is_me):
+    """For each paper sent to review: its co-authors already in the spreadsheet (from used papers) and the ones
+    who are not, i.e. who would be added by --include."""
+    index = {}
+    for p in people:
+        index.setdefault(p['lk'], []).append(p)
+    for d in review:
+        d['_in'], d['_out'] = [], []
+        for a in d.get('author') or []:
+            if IS_GROUP.search(a) or is_me(a):
+                continue
+            l, f = split_name(a)
+            g = given(f)
+            hit = next((p for p in index.get(last_key(l), []) if g and p['g'] and compatible(g, p['g'])), None)
+            (d['_in'] if hit else d['_out']).append((hit.get('row') if hit else None, a))
+    return review
+
+
+def row_ranges(rows):
+    rows = sorted(r for r in rows if r)
+    out = []
+    for r in rows:
+        if out and r == out[-1][1] + 1:
+            out[-1][1] = r
+        else:
+            out.append([r, r])
+    return ', '.join(f'{a}' if a == b else f'{a}-{b}' for a, b in out)
+
+
+def short_ranges(rows, limit=60, prefix=''):
+    """row_ranges, or 'N rows, first-last (not contiguous)' when that would not fit on a slide."""
+    rows = sorted({r for r in rows if r})
+    full = prefix + row_ranges(rows).replace(', ', ', ' + prefix)
+    if not rows or len(full) <= limit:
+        return full
+    return f'{len(rows)} {"papers" if prefix else "rows"} in {prefix}{rows[0]}-{prefix}{rows[-1]}'
+
+
+def num_ranges(nums):
+    return '#' + row_ranges(nums).replace(', ', ', #') if nums else ''
+
+
+# ---------------------------------------------------------------- slides
+def make_slides(path, person, report, secs, people, concerns, flags, review=()):
+    """A .pptx summary for checking the COA: papers by collaboration, co-authors by group, items to check."""
+    try:
+        from pptx import Presentation
+        from pptx.util import Inches, Pt
+        from pptx.dml.color import RGBColor
+    except ImportError:
+        sys.exit('--slides needs python-pptx: pip install python-pptx')
+    NAVY, GREY, RED, LIGHT = RGBColor(0x1E, 0x27, 0x61), RGBColor(0x55, 0x5B, 0x6E), RGBColor(0xB0, 0x1E, 0x2D), \
+        RGBColor(0xEE, 0xF1, 0xF8)
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)
+    blank = prs.slide_layouts[6]
+
+    def text(slide, x, y, w, h, lines, size=12, color=GREY, bold=False):
+        tf = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h)).text_frame
+        tf.word_wrap = True
+        for i, ln in enumerate(lines if isinstance(lines, list) else [lines]):
+            par = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            par.text = ln
+            par.font.size, par.font.color.rgb, par.font.bold, par.font.name = Pt(size), color, bold, 'Calibri'
+        return tf
+
+    def new(title, sub=''):
+        sl = prs.slides.add_slide(blank)
+        text(sl, 0.5, 0.3, 12.3, 0.7, title, 26, NAVY, True)
+        if sub:
+            text(sl, 0.5, 0.95, 12.3, 0.4, sub, 13, GREY)
+        return sl
+
+    def table(sl, header, rows, widths, y=1.45, size=10):
+        shp = sl.shapes.add_table(len(rows) + 1, len(header), Inches(0.5), Inches(y),
+                                  Inches(sum(widths)), Inches(0.3 * (len(rows) + 1)))
+        t = shp.table
+        for j, w in enumerate(widths):
+            t.columns[j].width = Inches(w)
+        for i, row in enumerate([header] + rows):
+            for j, v in enumerate(row):
+                c = t.cell(i, j)
+                c.text = str(v)
+                c.margin_top = c.margin_bottom = Inches(0.02)
+                for par in c.text_frame.paragraphs:
+                    par.font.size, par.font.name = Pt(size), 'Calibri'
+                    par.font.bold = i == 0
+                    par.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF) if i == 0 else RGBColor(0x22, 0x22, 0x22)
+                c.fill.solid()
+                c.fill.fore_color.rgb = NAVY if i == 0 else (LIGHT if i % 2 else RGBColor(0xFF, 0xFF, 0xFF))
+        return t
+
+    def paged(title, sub, header, rows, widths, per=16, size=10):
+        if not rows:
+            return
+        n = (len(rows) + per - 1) // per
+        for k in range(n):
+            table(new(title + (f' ({k + 1}/{n})' if n > 1 else ''), sub), header, rows[k * per:(k + 1) * per],
+                  widths, size=size)
+
+    n_used = sum(len(ds) for sec, _, ds in secs if not sec.startswith('Not used'))
+    by_group = {}
+    for p in people:
+        by_group.setdefault(p['group'], []).append(p)
+    groups = sorted(by_group, key=group_order)
+
+    # 1. title
+    sl = prs.slides.add_slide(blank)
+    text(sl, 0.8, 2.2, 11.7, 1.0, f'COA check: {person}', 40, NAVY, True)
+    text(sl, 0.8, 3.3, 11.7, 2.5, [
+        f'Co-authors from NASA ADS, papers since {report["since"]}  |  generated {report["generated"]}',
+        f'{n_used} papers used, '
+        f'{len(people)} unique co-authors, {len(report.get("added", []))} added to Table 4, '
+        f'{len(report["already_listed"])} already listed',
+        f'Query: {report["query"]}',
+        f'Countries-of-concern matches: {len(concerns)}   |   items to review: {sum(len(v) for v in flags.values())}'],
+        16)
+
+    # 2. papers by collaboration
+    rows = []
+    for sec, sub, ds in secs:
+        na = [len(d.get('author') or []) for d in ds]
+        names = {p['name'] for p in people for b in p['papers'] if b in {d['bibcode'] for d in ds}}
+        rows.append([sub or sec, len(ds), short_ranges([d['_num'] for d in ds], 45, '#'),
+                     f'{min(na)}' if min(na) == max(na) else f'{min(na)}-{max(na)}',
+                     '' if sec.startswith('Not used') else len(names)])
+    paged('Papers used, by collaboration',
+          'Author-list length: fewest-most authors on one paper in that row. Unique co-authors: different people '
+          '(not you) on those papers together, counted once.',
+          ['Collaboration', 'Papers', 'Paper #', 'Author-list length', 'Unique co-authors'], rows,
+          [4.4, 0.9, 3.6, 1.8, 1.6], per=14, size=11)
+
+    # 3. co-authors by group
+    rows = [[g, len(by_group[g]), short_ranges([p.get('row') for p in by_group[g]], 40),
+             short_ranges(sorted({n for p in by_group[g] for n in p['paper_nums']}), 45, '#')] for g in groups]
+    paged('Co-authors, by group', 'Each co-author is placed in one group from the papers you share. '
+          'Rows are Table 4 rows in the .xlsx (contiguous with --order collab).',
+          ['Group', 'Co-authors', 'Table 4 rows', 'From papers'], rows, [4.4, 1.2, 3.4, 3.3], per=14, size=11)
+
+    # 4. countries of concern
+    sub = ('Any affiliation on any shared paper naming China (incl. Hong Kong, Macau), Cuba, Iran, North Korea, '
+           'Russia or Venezuela. Text match: verify each.')
+    if concerns:
+        paged(f'Countries of concern: {len(concerns)} co-authors', sub,
+              ['Name', 'Country', 'Matching affiliation', 'Row', 'Group', 'Papers'],
+              [[h['name'], ', '.join(h['countries']), h['affiliations'][0][:110] +
+                (f' (+{len(h["affiliations"]) - 1} more)' if len(h['affiliations']) > 1 else ''),
+                h['row'] or '', h['group'][:28], short_ranges(h['papers'], 30, '#')] for h in concerns],
+              [2.2, 1.1, 5.2, 0.6, 1.8, 1.4], per=13, size=9)
+    else:
+        text(new('Countries of concern: none found', sub), 0.5, 1.6, 12, 1, 'No affiliation matched.', 16)
+
+    # 5. questionable
+    q = [p for g in groups if g.startswith('Questionable') for p in by_group[g]]
+    paged(f'Questionable: {len(q)} co-authors without a clear collaboration',
+          'Only on large papers with no collaboration named, or on papers whose collaboration was guessed',
+          ['Name', 'Affiliation', 'Row', 'Group', 'Papers'],
+          [[p['name'], p['affiliation'][:80], p.get('row') or '', p['group'].split(': ')[1],
+            short_ranges(p['paper_nums'], 30, '#')] for p in sorted(q, key=lambda p: fold(p['name']))],
+          [2.4, 5.2, 0.7, 2.6, 1.4], per=15, size=9)
+    rows = [[k.replace('_', ' '), ' / '.join(x) if isinstance(x, list) else
+             (f'{x["sheet"]}  vs  {x["ads"]}' if isinstance(x, dict) else x)]
+            for k, v in flags.items() for x in v]
+    paged(f'Names to check: {len(rows)}', 'Possible merges of two people, missing affiliations, near-duplicates',
+          ['Check', 'Names'], rows, [3.0, 9.3], per=16, size=10)
+
+    # 5b. papers sent to review: why, and which of their co-authors are (not) in the spreadsheet
+    if review:
+        paged(f'To review: {len(review)} papers not used',
+              'Not confirmed as yours, so not used. Their co-authors are in the spreadsheet only if they are also on a '
+              'used paper. If a paper is yours, rerun with --include BIBCODE.',
+              ['#', 'Title', 'Authors', 'Your affiliation on it', 'Why not used', 'Not in sheet'],
+              [[d['_num'], d['_title'][:90], len(d.get('author') or []), (d.get('_slot_aff') or 'none listed')[:60],
+                d['_why'][:150], len(d['_out'])] for d in review],
+              [0.5, 4.0, 0.8, 2.6, 3.4, 1.0], per=10, size=9)
+        per = 2 * 24
+        for d in review:
+            out = sorted(d['_out'], key=lambda x: fold(x[1]))
+            inn = sorted(d['_in'], key=lambda x: (x[0] or 0, fold(x[1])))
+            n = max(1, (max(len(out), len(inn)) + per - 1) // per)
+            for k in range(n):
+                sl = new(f'To review #{d["_num"]}: co-authors' + (f' ({k + 1}/{n})' if n > 1 else ''),
+                         f'{d["_title"][:120]}  |  {d["bibcode"]}  |  {len(d.get("author") or [])} authors')
+                for x0, head, items, fmt, col in (
+                        (0.5, f'NOT in spreadsheet ({len(out)}): added only if you --include this paper', out,
+                         lambda r, a: a, RED),
+                        (6.9, f'Already in spreadsheet ({len(inn)}): from used papers, with Table 4 row', inn,
+                         lambda r, a: f'{r or "-"}  {a}', NAVY)):
+                    text(sl, x0, 1.4, 6.1, 0.4, head, 12, col, True)
+                    chunk = items[k * per:(k + 1) * per]
+                    for c in range(2):
+                        part = chunk[c * 24:(c + 1) * 24]
+                        if part:
+                            text(sl, x0 + c * 3.05, 1.85, 3.0, 5.4, [fmt(r, a) for r, a in part], 9,
+                                 RGBColor(0x22, 0x22, 0x22))
+                    if not items and k == 0:
+                        text(sl, x0, 1.85, 6, 0.4, 'none', 10)
+
+    # 6. paper list, one run of slides per section (joint papers share slides, labelled by combination)
+    merged = {}
+    for sec, sub, ds in secs:
+        merged.setdefault(sec, []).extend((sub, d) for d in ds)
+    for sec, items in merged.items():
+        paged(sec, f'{len(items)} papers', ['#', 'Date', 'Title', 'Journal', 'Authors', 'Bibcode / notes'],
+              [[d['_num'], d['pubdate'][:7], (f'[{sub}] ' if sub else '') + d['_title'][:120],
+                (d.get('pub') or '')[:38], len(d.get('author') or []),
+                d['bibcode'] + ('  ' + '; '.join(d['_flags']) if d['_flags'] else '')]
+               for sub, d in items], [0.5, 0.8, 5.6, 2.3, 0.8, 2.3], per=12, size=9)
+
+    # 7. co-author names by group
+    per_col, ncol = 26, 4
+    for g in groups:
+        ps = sorted(by_group[g], key=lambda p: (p.get('row') or 0, fold(p['name'])))
+        n = (len(ps) + per_col * ncol - 1) // (per_col * ncol)
+        for k in range(n):
+            chunk = ps[k * per_col * ncol:(k + 1) * per_col * ncol]
+            sl = new(f'{g} ({len(ps)})' + (f' ({k + 1}/{n})' if n > 1 else ''),
+                     f'Table 4 rows {short_ranges([p.get("row") for p in ps], 110)}'
+                     + ('' if len(short_ranges([p.get("row") for p in ps], 10**6)) <= 110 else
+                        '  (rerun with --order collab to make each group one block of rows)'))
+            for c in range(ncol):
+                col = chunk[c * per_col:(c + 1) * per_col]
+                if col:
+                    text(sl, 0.5 + c * 3.1, 1.45, 3.05, 5.9,
+                         [f'{p.get("row") or "-"}  {p["name"]}' for p in col], 9, RGBColor(0x22, 0x22, 0x22))
+    prs.save(path)
+    return len(prs.slides)
 
 
 # ---------------------------------------------------------------- workbook
@@ -380,7 +831,7 @@ def download_template(path):
     return path
 
 
-def fill_template(template, out, people, report, person=None, clear_samples=False):
+def fill_template(template, out, people, report, person=None, clear_samples=False, by_group=False):
     wb = openpyxl.load_workbook(template)
     ws = wb.worksheets[0]
     if TABLE4 not in ws.tables:
@@ -424,6 +875,7 @@ def fill_template(template, out, people, report, person=None, clear_samples=Fals
                                                                    sheet_row=same[0]['row']))
             new.append(p)
             continue
+        p['row'] = hit['row']
         report['already_listed'].append(dict(sheet=hit['name'], ads=p['name'], row=hit['row'],
                                              spelling_differs=hit['name'] != p['name']))
         # bring a stale Table 4 "Last Active" date forward
@@ -433,7 +885,7 @@ def fill_template(template, out, people, report, person=None, clear_samples=Fals
                 ws.cell(hit['row'], 5).value = nd
                 report['date_updates'].append(dict(name=hit['name'], old=cur.strftime('%m/%d/%Y'),
                                                    new=nd.strftime('%m/%d/%Y')))
-    new.sort(key=lambda p: fold(p['name']))
+    new.sort(key=lambda p: (group_order(p['group']) if by_group else (), fold(p['name'])))
 
     # use blank rows inside Table 4 first, then grow the table
     blanks = [r for r in range(first, last + 1)
@@ -492,6 +944,15 @@ def main():
     ap.add_argument('--include', nargs='+', default=[], metavar='BIBCODE',
                     help='search mode: papers to accept anyway (e.g. confirmed from the "review" list)')
     ap.add_argument('--exclude', nargs='+', default=[], metavar='BIBCODE', help='papers to leave out')
+    ap.add_argument('--list-papers', action='store_true',
+                    help='print a numbered list of the papers used, grouped by collaboration (CTAO, VERITAS, '
+                         'IceCube, ...), and write it to NAME_papers.md for checking')
+    ap.add_argument('--slides', action='store_true',
+                    help='write NAME_check.pptx: papers by collaboration, co-authors by group with their Table 4 '
+                         'rows, questionable names and countries-of-concern matches (needs python-pptx)')
+    ap.add_argument('--order', choices=('name', 'collab'), default='name',
+                    help='order of new Table 4 rows: alphabetical (default) or grouped by collaboration, '
+                         'so each group is one block of rows')
     ap.add_argument('--out', help='output .xlsx file name; the report is written next to it with .json '
                     '(default: <template>_ADS.xlsx, or coa_<Last>_ADS.xlsx for a downloaded template)')
     a = ap.parse_args()
@@ -546,8 +1007,12 @@ def main():
     for d in found:
         if d['bibcode'] in a.exclude:
             d['_status'], d['_why'] = 'reject', '--exclude'
+    classify_papers(found, is_me)
     docs = [d for d in found if d['_status'] == 'accept']
     people = collect_people(docs, is_me, a.max_authors)
+    review_docs = [d for d in found if d['_status'] == 'review']
+    secs = paper_sections(docs, a.max_authors, review_docs)
+    assign_groups(people, docs)
 
     out_xlsx = a.out or os.path.splitext(a.template)[0] + '_ADS.xlsx'
     if not out_xlsx.lower().endswith('.xlsx'):
@@ -557,18 +1022,22 @@ def main():
     out_json = os.path.splitext(out_xlsx)[0] + '.json'
     report = dict(person=person, query=query, since=since, generated=today.isoformat(), max_authors=a.max_authors,
                   papers=[dict(status=d['_status'], why=d['_why'], bibcode=d['bibcode'], date=d['pubdate'][:7],
+                               collaboration=' + '.join(d['_collab']) + (' (by author overlap)'
+                                                                         if d['_collab_how'] == 'overlap' else ''),
                                n_authors=len(d.get('author') or []), your_affiliation=d['_slot_aff'],
                                title=(d.get('title') or [''])[0], link=f'{UI}/abs/{d["bibcode"]}/abstract')
                           for d in sorted(found, key=lambda d: (('accept', 'review', 'reject').index(d['_status']),
                                                                 -d.get('_overlap', 0), d['bibcode']))],
                   already_listed=[], date_updates=[], characters_replaced=[], sample_rows_removed=[], possible_duplicates_of_sheet=[])
-    new = fill_template(a.template, out_xlsx, people, report, person, clear_samples=downloaded)
+    new = fill_template(a.template, out_xlsx, people, report, person, clear_samples=downloaded,
+                        by_group=a.order == 'collab')
 
     by_last = {}
     for p in people:
         by_last.setdefault(p['lk'], []).append(p)
     report.update(
-        added=[{k: p[k] for k in ('name', 'ads_name', 'affiliation', 'last_active', 'variants', 'papers', 'row')} for p in new],
+        added=[{k: p[k] for k in ('name', 'ads_name', 'affiliation', 'last_active', 'group', 'variants', 'papers',
+                                  'paper_nums', 'row')} for p in new],
         review=dict(
             initials_only_merges=[p['variants'] for p in people if len(p['variants']) > 1 and
                                   any(all(len(t) == 1 for t in given(split_name(v)[1])) for v in p['variants'])
@@ -577,10 +1046,29 @@ def main():
                                         len({q['g'][0][0] for q in g if q['g']}) < len(g)],
             possible_duplicates_of_sheet=report['possible_duplicates_of_sheet'],
             no_affiliation=[p['name'] for p in new if not p['affiliation']]))
+    review_coauthors(review_docs, people, is_me)
+    report['review_papers'] = [dict(number=d['_num'], bibcode=d['bibcode'], title=d['_title'], why=d['_why'],
+                                    your_affiliation=d['_slot_aff'],
+                                    coauthors_in_sheet=[dict(row=r, name=a) for r, a in d['_in']],
+                                    coauthors_not_in_sheet=[a for _, a in d['_out']]) for d in review_docs]
+    concerns = concern_matches(people)
+    report['countries_of_concern'] = concerns
+    if a.slides:
+        out_pptx = os.path.splitext(out_xlsx)[0] + '_check.pptx'
+        n_sl = make_slides(out_pptx, person, report, secs, people, concerns, report['review'], review_docs)
+        print(f'Slides written to {out_pptx} ({n_sl} slides)')
     seen = orcids_seen(found, is_me) if not a.link else []
     report['orcids_on_accepted_papers'] = seen
     with open(out_json, 'w', encoding='utf-8') as f:
         json.dump(report, f, indent=1, ensure_ascii=False)
+
+    if a.list_papers:
+        listing = paper_list(docs, a.max_authors, person, review_docs)
+        out_md = os.path.splitext(out_xlsx)[0] + '_papers.md'
+        with open(out_md, 'w', encoding='utf-8') as f:
+            f.write(listing + '\n')
+        print('\n' + listing + '\n')
+        print(f'Paper list written to {out_md}')
 
     n = {s: sum(d['_status'] == s for d in found) for s in ('accept', 'review', 'reject')}
     if not a.link:
@@ -594,6 +1082,9 @@ def main():
             print(f'  Warning: accepted papers mostly carry ORCID {seen[0][0]}, not {a.orcid}')
     print(f'{len(docs)} papers used, {len(people)} unique co-authors, {len(report["already_listed"])} already listed, '
           f'{len(new)} added, {len(report["date_updates"])} dates updated')
+    if concerns:
+        print(f'{len(concerns)} co-authors have an affiliation in a listed country of concern; '
+              f'see "countries_of_concern" in the .json' + (' and the slides' if a.slides else ''))
     print(f'Wrote {out_xlsx} and {out_json}  (open the .xlsx in Excel and re-save once before uploading)')
 
 
