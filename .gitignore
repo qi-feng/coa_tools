@@ -1,0 +1,5 @@
+# publish only the README and the script; keep COA outputs and templates local
+*
+!.gitignore
+!README.md
+!ads_to_coa.py
