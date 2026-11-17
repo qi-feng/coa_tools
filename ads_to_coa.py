@@ -309,7 +309,10 @@ def collect_people(docs, is_me, max_authors):
         last, first = split_name(r['name'])
         r['lk'], r['g'] = last_key(last), given(first)
         for c in by_last.get(r['lk'], []):
-            if all(compatible(r['g'], m['g']) for m in c):
+            # same initials AND, when both list one, affiliations naming the same place: "Williams, D." at Glasgow
+            # is not merged into "Williams, D. R." at Alabama (a missing COA entry is worse than an extra row)
+            if all(compatible(r['g'], m['g']) and (not r['aff'] or not m['aff'] or same_place([r['aff'], m['aff']]))
+                   for m in c):
                 c.append(r)
                 break
         else:
@@ -325,7 +328,8 @@ def collect_people(docs, is_me, max_authors):
             name=best['name'], affiliation=next((m['aff'] for m in newest if m['aff']), ''),
             last_active=newest[0]['date'], variants=sorted(m['name'] for m in c),
             papers=sorted({p for m in c for p in m['papers']}), lk=best['lk'], g=best['g'],
-            raw={k: v for m in c for k, v in m['raw'].items()}))
+            raw={k: v for m in c for k, v in m['raw'].items()},
+            variant_affs={m['name']: m['aff'] for m in c}))
     return people
 
 
@@ -561,6 +565,20 @@ def review_coauthors(review, people, is_me):
     return review
 
 
+AFF_STOP = set("""university universita universitat universite universidad universidade institute institut instituto istituto
+national nazionale nacional department dipartimento departamento faculty school college center centre centro laboratory
+laboratorio physics fisica physik physique astronomy astrophysics astrophysical astrofisica sciences science research
+group sezione section studi studies degli della delle dell interateneo division technology technical engineering
+observatory osservatorio observatoire academy and the for with magic infn inaf cnrs csic italy spain germany france
+japan usa united states kingdom china republic""".split())
+
+
+def same_place(affs):
+    """True if every pair of non-empty affiliations shares a distinctive word (city, university name, ...)."""
+    toks = [{w for w in re.findall(r'[a-z]{4,}', fold(a)) if w not in AFF_STOP} for a in affs if a]
+    return all(t1 & t2 for i, t1 in enumerate(toks) for t2 in toks[i + 1:])
+
+
 def row_ranges(rows):
     rows = sorted(r for r in rows if r)
     out = []
@@ -703,11 +721,35 @@ def make_slides(path, person, report, secs, people, concerns, flags, review=()):
           [[p['name'], p['affiliation'][:80], p.get('row') or '', p['group'].split(': ')[1],
             short_ranges(p['paper_nums'], 30, '#')] for p in sorted(q, key=lambda p: fold(p['name']))],
           [2.4, 5.2, 0.7, 2.6, 1.4], per=15, size=9)
-    rows = [[k.replace('_', ' '), ' / '.join(x) if isinstance(x, list) else
-             (f'{x["sheet"]}  vs  {x["ads"]}' if isinstance(x, dict) else x)]
-            for k, v in flags.items() for x in v]
-    paged(f'Names to check: {len(rows)}', 'Possible merges of two people, missing affiliations, near-duplicates',
-          ['Check', 'Names'], rows, [3.0, 9.3], per=16, size=10)
+    m = flags.get('initials_only_merges', [])
+    m = sorted(m, key=lambda x: (x['same_affiliation'], x['row'] or 0))  # different affiliations first
+    n_diff = sum(not x['same_affiliation'] for x in m)
+    paged(f'Merged spellings: {len(m)} co-authors, one row each ({n_diff} with different affiliations, listed first)',
+          'Spellings combined into ONE row because the initials agree. Same affiliation: almost surely one person. '
+          'Different: check, and add the other by hand if needed.',
+          ['Row', 'Spellings combined into this row', 'Affiliation of each spelling (most recent paper)'],
+          [[x['row'] or '', '  +  '.join(x['merged']),
+            ('same: ' + next((a for a in x['affiliations'].values() if a), '(none)')[:85]) if x['same_affiliation'] else
+            '  |  '.join(f'{v.split(",")[1].strip() if "," in v else v}: {(a or "(none)")[:45]}'
+                         for v, a in x['affiliations'].items())]
+           for x in m], [0.7, 3.9, 7.7], per=14, size=9)
+    sep = flags.get('same_last_name_and_initial', [])
+    paged(f'Kept separate: {len(sep)} sets of people with the same surname and first initial',
+          'Each has their OWN row: initials or given names differ, or affiliations differ. '
+          'Delete a row only if two are really the same person (e.g. someone who moved).',
+          ['Rows', 'Separate people (row: name, affiliation)'],
+          [[', '.join(str(x['row'] or '-') for x in g),
+            '   |   '.join(f'{x["row"] or "-"}: {x["name"]} ({(x.get("affiliation") or "no affiliation")[:40]})'
+                           for x in g)]
+           for g in sep], [1.4, 10.9], per=12, size=9)
+    dup = flags.get('possible_duplicates_of_sheet', [])
+    paged(f'Near-duplicates of names already on the sheet: {len(dup)}',
+          'Added as a new row, but close to an existing entry. Delete one if they are the same person.',
+          ['Existing row', 'Already on sheet', 'Added from ADS'],
+          [[x['sheet_row'], x['sheet'], x['ads']] for x in dup], [1.4, 5.4, 5.5], per=16, size=10)
+    na = flags.get('no_affiliation', [])
+    paged(f'No affiliation in ADS: {len(na)} co-authors', 'Fill in the affiliation by hand',
+          ['Row', 'Name'], [[x['row'] or '', x['name']] for x in na], [1.0, 11.3], per=16, size=10)
 
     # 5b. papers sent to review: why, and which of their co-authors are (not) in the spreadsheet
     if review:
@@ -722,7 +764,8 @@ def make_slides(path, person, report, secs, people, concerns, flags, review=()):
         for d in review:
             out = sorted(d['_out'], key=lambda x: fold(x[1]))
             inn = sorted(d['_in'], key=lambda x: (x[0] or 0, fold(x[1])))
-            n = max(1, (max(len(out), len(inn)) + per - 1) // per)
+            show_in = len(inn) <= per  # a long list of people already in the sheet is shown as a count
+            n = max(1, (max(len(out), len(inn) if show_in else 0) + per - 1) // per)
             for k in range(n):
                 sl = new(f'To review #{d["_num"]}: co-authors' + (f' ({k + 1}/{n})' if n > 1 else ''),
                          f'{d["_title"][:120]}  |  {d["bibcode"]}  |  {len(d.get("author") or [])} authors')
@@ -732,6 +775,11 @@ def make_slides(path, person, report, secs, people, concerns, flags, review=()):
                         (6.9, f'Already in spreadsheet ({len(inn)}): from used papers, with Table 4 row', inn,
                          lambda r, a: f'{r or "-"}  {a}', NAVY)):
                     text(sl, x0, 1.4, 6.1, 0.4, head, 12, col, True)
+                    if items is inn and not show_in:
+                        if k == 0:
+                            text(sl, x0, 1.85, 6, 0.8, f'{len(inn)} people, all already in the spreadsheet from used '
+                                 f'papers (list in the .json under review_papers)', 10)
+                        continue
                     chunk = items[k * per:(k + 1) * per]
                     for c in range(2):
                         part = chunk[c * 24:(c + 1) * 24]
@@ -1033,19 +1081,26 @@ def main():
                         by_group=a.order == 'collab')
 
     by_last = {}
-    for p in people:
-        by_last.setdefault(p['lk'], []).append(p)
+    for p in people:  # same surname and same first initial, kept as separate people
+        if p['g']:
+            by_last.setdefault((p['lk'], p['g'][0][0]), []).append(p)
     report.update(
         added=[{k: p[k] for k in ('name', 'ads_name', 'affiliation', 'last_active', 'group', 'variants', 'papers',
                                   'paper_nums', 'row')} for p in new],
         review=dict(
-            initials_only_merges=[p['variants'] for p in people if len(p['variants']) > 1 and
-                                  any(all(len(t) == 1 for t in given(split_name(v)[1])) for v in p['variants'])
-                                  and len({v for v in p['variants']}) > 1],
-            same_last_name_and_initial=[[q['name'] for q in g] for g in by_last.values() if len(g) > 1 and
-                                        len({q['g'][0][0] for q in g if q['g']}) < len(g)],
+            # several spellings merged into ONE row, at least one of them initials only (e.g. "Kim, J." + "Kim, J.-Y.")
+            initials_only_merges=[dict(row=p.get('row'), name=p['name'], merged=p['variants'],
+                                       affiliations={v: p['variant_affs'].get(v, '') for v in p['variants']},
+                                       same_affiliation=same_place(p['variant_affs'].values()))
+                                  for p in people
+                                  if len(p['variants']) > 1 and
+                                  any(all(len(t) == 1 for t in given(split_name(v)[1])) for v in p['variants'])],
+            # SEPARATE rows for people with the same surname and first initial (e.g. "Williams, D. A." and "D. R.")
+            same_last_name_and_initial=[[dict(row=q.get('row'), name=q['name'], affiliation=q['affiliation']) for q in
+                                         sorted(g, key=lambda q: (q.get('row') or 0, fold(q['name'])))]
+                                        for g in by_last.values() if len(g) > 1],
             possible_duplicates_of_sheet=report['possible_duplicates_of_sheet'],
-            no_affiliation=[p['name'] for p in new if not p['affiliation']]))
+            no_affiliation=[dict(row=p.get('row'), name=p['name']) for p in new if not p['affiliation']]))
     review_coauthors(review_docs, people, is_me)
     report['review_papers'] = [dict(number=d['_num'], bibcode=d['bibcode'], title=d['_title'], why=d['_why'],
                                     your_affiliation=d['_slot_aff'],

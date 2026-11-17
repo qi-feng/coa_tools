@@ -154,8 +154,16 @@ Google Slides and go through it in order:
    spreadsheet** (they would be added if you rerun with `--include BIBCODE`) and those **already in the spreadsheet**
    from used papers, with their Table 4 row. A paper that is yours but adds no one new can be left out safely.
    The same lists are in the `.json` under `review_papers`.
-7. **Names to check**: possible merges of two people with the same initials, missing affiliations, and near-duplicates
-   of names already on the sheet (the `review` section of the `.json`).
+7. **Names to check**, in four lists, each with Table 4 rows:
+   - *Merged spellings*: spellings combined into **one** row because the initials agree, e.g. `Tandon, S.` +
+     `Tandon, Svanik` or `Tian, W.` + `Tian, W. W.` (both at ICRR Tokyo), with each spelling's affiliation.
+     Spellings with different affiliations are not merged; any merge listed with different affiliations comes
+     from a spelling with no affiliation in between and is shown first.
+   - *Kept separate*: people with the same surname and first initial who each have **their own** row, because later
+     initials, given names or affiliations differ, e.g. `Williams, David A.` and `Williams, D. R.`. Delete a row only
+     if two are really one person (e.g. someone who changed institution).
+   - *Near-duplicates* of names already on the sheet.
+   - *No affiliation* in ADS: fill in by hand.
 8. **Paper list**: every paper, numbered, by section, with date, title, journal, author count, bibcode and notes
    (duplicate titles, papers skipped by `--max-authors`, guessed collaborations). The papers under *Not used: to review*
    can be added with `--include`.
@@ -168,7 +176,10 @@ wants them listed (see **Large collaborations**).
 ## What it does with the papers
 
 - Lists each unique co-author once.
-  Spelling variants such as `Hinton, J.` and `Hinton, J. A.`, or names with and without accents, count as one person.
+  Spelling variants such as `Hinton, J.` and `Hinton, J. A.`, or names with and without accents, count as one person,
+  as long as the initials agree and their affiliations name the same place (or one has none). `Williams, D.` at Glasgow
+  is not merged into `Williams, D. R.` at Alabama: they get separate rows and are listed under *Kept separate*.
+  Someone who moved may then appear twice; delete the extra row.
 - Skips anyone already named on the sheet with a compatible name (same last name and matching given names or initials).
   If an existing Table 4 row has an older "Last Active" date, it moves that date forward.
   A near-match such as sheet "Smith, Andrew W." vs ADS "Smith, A. J." is added and flagged.
@@ -184,9 +195,9 @@ wants them listed (see **Large collaborations**).
 
 1. In search mode, look at the `review` papers in the `.json` and rerun with `--include` for yours.
 2. Open the `.xlsx` in Excel and save it once, so Excel rewrites its internal metadata.
-3. Read the `review` section at the end of the `.json`:
-   - `initials_only_merges`: e.g. `Kim, J.` merged with `Kim, J.-Y.`. These might be two different people.
-   - `same_last_name_and_initial`: kept as separate people; check none is a duplicate.
+3. Read the `review` section at the end of the `.json` (or the *Names to check* slides):
+   - `initials_only_merges`: spellings merged into one row, e.g. `Kim, J.` with `Kim, J.-Y.`. These might be two people.
+   - `same_last_name_and_initial`: kept as separate rows (e.g. `Williams, D. A.` and `Williams, D. R.`); check none is a duplicate.
    - `possible_duplicates_of_sheet`: added, but close to a name already on the sheet.
    - `no_affiliation`: ADS had no affiliation; fill it in by hand.
 
